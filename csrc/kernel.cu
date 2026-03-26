@@ -1,6 +1,9 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <torch/extension.h>
 #include "state.h"
+#include "ops.h"
+#include <cub/cub.cuh>
 
 __device__ void computeCov3D(const float3 scale, const float4 q, float* cov3D)
 {
@@ -105,6 +108,61 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
     return ((v + 1.0f) * S - 1.0f) * 0.5f;
 }
 
+__global__ void duplicateWithKeys(
+    int P,
+    const float2* points2D,
+    const float* depths,
+    const uint32_t* offsets,
+    uint64_t* sort_keys,
+    uint32_t* sort_values,
+    int W, int H, float radius,
+    dim3 grid)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= P) return;
+
+    if (depths[idx] > 0.2f) {
+        uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
+        float2 p2d = points2D[idx];
+
+        int x_min = max(0, (int)floorf((p2d.x - radius) / 16.0f));
+        int x_max = min((int)grid.x, (int)ceilf((p2d.x + radius) / 16.0f));
+        int y_min = max(0, (int)floorf((p2d.y - radius) / 16.0f));
+        int y_max = min((int)grid.y, (int)ceilf((p2d.y + radius) / 16.0f));
+
+        uint32_t d_bit = __float_as_uint(depths[idx]);
+
+        for (int y = y_min; y < y_max; y++) {
+            for (int x = x_min; x < x_max; x++) {
+                uint64_t key = (uint64_t)(y * grid.x + x);
+                key <<= 32;
+                key |= d_bit;
+
+                sort_keys[off] = key;
+                sort_values[off] = idx;
+                off++;
+            }
+        }
+    }
+}
+
+__global__ void identifyTileRanges(int L, const uint64_t* keys, uint2* ranges) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= L) return;
+
+    uint32_t cur_tile = (uint32_t)(keys[idx] >> 32);
+    if (idx == 0)
+        ranges[cur_tile].x = 0;
+    else {
+        uint32_t prev_tile = (uint32_t)(keys[idx - 1] >> 32);
+        if (cur_tile != prev_tile) {
+            ranges[prev_tile].y = idx;
+            ranges[cur_tile].x = idx;
+        }
+    }
+    if (idx == L - 1) ranges[cur_tile].y = L;
+}
+
 __global__ void preprocess_points_kernel(
     int P,
     const float3* points3D,
@@ -119,6 +177,8 @@ __global__ void preprocess_points_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= P) return;
 
+    s.tile_counts[idx] = 0;
+    s.point_offsets[idx] = 0;
     float3 p_origin = points3D[idx];
     float3 p_view = transformPoint4x3(p_origin, viewmatrix);
     if (p_view.z < 0.2f) return;
@@ -146,5 +206,166 @@ __global__ void preprocess_points_kernel(
 
 void preprocess_points(int P, const float3* points3D, const float* viewmatrix, const float* projmatrix,
 const float focal_x, const float focal_y, int W, int H, float r, PointState s) {
-    preprocess_points_kernel<<<(P+255)/256, 256>>>(P, points3D, viewmatrix, projmatrix, focal_x, focal_y, W, H, r, s);
+    preprocess_points_kernel<<<(P + 255) / 256, 256>>>(P, points3D, viewmatrix, projmatrix, focal_x, focal_y, W, H, r, s);
+}
+
+void duplicate_points(int P, int L, int W, int H, float radius, int grid_x, int grid_y, PointState s){
+    dim3 grid(grid_x, grid_y, 1);
+    duplicateWithKeys<<<(P + 255) / 256, 256>>>(P, s.points2D, s.depths, s.point_offsets, s.sort_keys, s.sort_values, W, H, radius, grid);
+}
+
+void identify_ranges(int L, const uint64_t* keys, uint2* ranges_ptr){
+    identifyTileRanges<<<(L + 255) / 256, 256>>>(L, keys, ranges_ptr);
+}
+
+std::tuple<
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor,
+    torch::Tensor>
+run_tiler_cuda(
+    torch::Tensor points3D,
+    torch::Tensor viewmatrix,
+    torch::Tensor projmatrix,
+    torch::Tensor scales,
+    torch::Tensor rotations,
+    float focal_x,
+    float focal_y,
+    int W,
+    int H,
+    float radius)
+{
+    int P = points3D.size(0);
+    const int grid_x = (W + 15) / 16;
+    const int grid_y = (H + 15) / 16;
+    const int num_tiles = grid_x * grid_y;
+
+    auto pts_c = points3D.contiguous();
+    auto view_c = viewmatrix.contiguous();
+    auto proj_c = projmatrix.contiguous();
+    auto sc_c = scales.contiguous();
+    auto rot_c = rotations.contiguous();
+
+    auto make_byte_tensor = [&](size_t bytes) {
+        return torch::empty({static_cast<long long>(bytes)}, points3D.options().dtype(torch::kByte));
+    };
+
+    size_t geom_bytes = P * 96 + 1024;
+    torch::Tensor geom_buffer = make_byte_tensor(geom_bytes);
+    char* geom_chunk = reinterpret_cast<char*>(geom_buffer.contiguous().data_ptr());
+    PointState s_geom = PointState::fromChunk(geom_chunk, P, 0, 0);
+
+    cudaMemcpyAsync(s_geom.scales, sc_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(s_geom.quat, rot_c.data_ptr<float>(), P * sizeof(float4), cudaMemcpyDeviceToDevice);
+
+    preprocess_points(
+        P,
+        reinterpret_cast<float3*>(pts_c.data_ptr<float>()),
+        view_c.data_ptr<float>(),
+        proj_c.data_ptr<float>(),
+        focal_x,
+        focal_y,
+        W,
+        H,
+        radius,
+        s_geom);
+
+    size_t scan_temp_bytes = 0;
+    cub::DeviceScan::InclusiveSum(nullptr, scan_temp_bytes, s_geom.tile_counts, s_geom.point_offsets, P);
+
+    torch::Tensor scan_temp = make_byte_tensor(scan_temp_bytes);
+    cub::DeviceScan::InclusiveSum(
+        scan_temp.data_ptr(),
+        scan_temp_bytes,
+        s_geom.tile_counts,
+        s_geom.point_offsets,
+        P);
+
+    uint32_t L = 0;
+    cudaMemcpy(&L, s_geom.point_offsets + P - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+    size_t sort_temp_bytes = 0;
+    cub::DeviceRadixSort::SortPairs(
+        nullptr,
+        sort_temp_bytes,
+        static_cast<uint64_t*>(nullptr),
+        static_cast<uint64_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr),
+        static_cast<uint32_t*>(nullptr),
+        L);
+
+    size_t cub_temp_bytes = scan_temp_bytes > sort_temp_bytes ? scan_temp_bytes : sort_temp_bytes;
+    size_t final_bytes =
+        geom_bytes +
+        (2 * L * sizeof(uint64_t)) +
+        (2 * L * sizeof(uint32_t)) +
+        (num_tiles * sizeof(uint2)) +
+        cub_temp_bytes +
+        2048;
+
+    torch::Tensor final_buffer = make_byte_tensor(final_bytes);
+    char* chunk = reinterpret_cast<char*>(final_buffer.contiguous().data_ptr());
+    PointState s = PointState::fromChunk(chunk, P, L, num_tiles);
+
+    uint64_t* sort_keys_out = nullptr;
+    uint32_t* sort_values_out = nullptr;
+    obtain(chunk, sort_keys_out, L);
+    obtain(chunk, sort_values_out, L);
+
+    char* cub_temp_ptr = chunk;
+
+    cudaMemcpyAsync(s.scales, sc_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(s.quat, rot_c.data_ptr<float>(), P * sizeof(float4), cudaMemcpyDeviceToDevice);
+
+    preprocess_points(
+        P,
+        reinterpret_cast<float3*>(pts_c.data_ptr<float>()),
+        view_c.data_ptr<float>(),
+        proj_c.data_ptr<float>(),
+        focal_x,
+        focal_y,
+        W,
+        H,
+        radius,
+        s);
+
+    cub::DeviceScan::InclusiveSum(
+        cub_temp_ptr,
+        scan_temp_bytes,
+        s.tile_counts,
+        s.point_offsets,
+        P);
+
+    duplicate_points(P, L, W, H, radius, grid_x, grid_y, s);
+
+    cub::DeviceRadixSort::SortPairs(
+        cub_temp_ptr,
+        sort_temp_bytes,
+        s.sort_keys,
+        sort_keys_out,
+        s.sort_values,
+        sort_values_out,
+        L);
+
+    identify_ranges(L, sort_keys_out, s.tile_ranges);
+
+    auto res_2d = torch::from_blob(s.points2D, {P, 2}, points3D.options()).clone();
+    auto res_counts = torch::from_blob(s.tile_counts, {P}, points3D.options().dtype(torch::kInt)).clone();
+    auto res_cov3d = torch::from_blob(s.cov3D, {P, 6}, points3D.options()).clone();
+    auto res_conic = torch::from_blob(s.conic, {P, 3}, points3D.options()).clone();
+    auto res_ranges = torch::from_blob(s.tile_ranges, {num_tiles, 2}, points3D.options().dtype(torch::kInt)).clone();
+    auto res_keys = torch::from_blob(sort_keys_out, {L}, points3D.options().dtype(torch::kInt64)).clone();
+    auto res_values = torch::from_blob(sort_values_out, {L}, points3D.options().dtype(torch::kInt)).clone();
+
+    return std::make_tuple(
+        res_2d,
+        res_counts,
+        res_cov3d,
+        res_conic,
+        res_ranges,
+        res_keys,
+        res_values);
 }
