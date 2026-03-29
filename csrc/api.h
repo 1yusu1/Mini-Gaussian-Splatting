@@ -11,7 +11,7 @@ std::tuple<
     torch::Tensor,
     torch::Tensor,
     torch::Tensor>
-preprocess_cuda(
+preprocess_checked(
     torch::Tensor points3D,
     torch::Tensor viewmatrix,
     torch::Tensor projmatrix,
@@ -26,7 +26,7 @@ preprocess_cuda(
     float radius);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-render_forward_cuda(
+render_forward_checked(
     torch::Tensor points2D,
     torch::Tensor conic_opacity,
     torch::Tensor colors,
@@ -36,7 +36,7 @@ render_forward_cuda(
     int H);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-render_scene_cuda(
+render_scene_checked(
     torch::Tensor points3D,
     torch::Tensor viewmatrix,
     torch::Tensor projmatrix,
@@ -51,7 +51,7 @@ render_scene_cuda(
     float radius);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-render_backward_cuda(
+render_backward_checked(
     torch::Tensor points2D,
     torch::Tensor conic_opacity,
     torch::Tensor colors,
@@ -65,7 +65,7 @@ render_backward_cuda(
     int H);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-preprocess_backward_cuda(
+preprocess_backward_checked(
     torch::Tensor points3D,
     torch::Tensor viewmatrix,
     torch::Tensor projmatrix,
@@ -83,7 +83,7 @@ preprocess_backward_cuda(
     float radius);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-backward_scene_cuda(
+backward_scene_checked(
     torch::Tensor points3D,
     torch::Tensor viewmatrix,
     torch::Tensor projmatrix,

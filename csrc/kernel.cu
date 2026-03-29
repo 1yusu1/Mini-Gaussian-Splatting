@@ -1,9 +1,31 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cooperative_groups.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
+#include <stdexcept>
 #include "state.h"
 #include "ops.h"
 #include <cub/cub.cuh>
+
+namespace cg = cooperative_groups;
+
+namespace {
+
+constexpr int kTileWidth = 16;
+constexpr int kTileHeight = 16;
+constexpr int kThreadsPerBlock = kTileWidth * kTileHeight;
+constexpr float kNearPlane = 0.2f;
+constexpr float kAlphaThreshold = 1.0f / 255.0f;
+constexpr float kTransmittanceEpsilon = 0.0001f;
+
+}
+
+static inline void checkCuda(cudaError_t err, const char* context) {
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(err));
+    }
+}
 
 __device__ void computeCov3D(const float3 scale, const float4 q, float* cov3D)
 {
@@ -121,14 +143,14 @@ __global__ void duplicateWithKeys(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= P) return;
 
-    if (depths[idx] > 0.2f) {
+    if (depths[idx] > kNearPlane) {
         uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
         float2 p2d = points2D[idx];
 
-        int x_min = max(0, (int)floorf((p2d.x - radius) / 16.0f));
-        int x_max = min((int)grid.x, (int)ceilf((p2d.x + radius) / 16.0f));
-        int y_min = max(0, (int)floorf((p2d.y - radius) / 16.0f));
-        int y_max = min((int)grid.y, (int)ceilf((p2d.y + radius) / 16.0f));
+        int x_min = max(0, (int)floorf((p2d.x - radius) / (float)kTileWidth));
+        int x_max = min((int)grid.x, (int)ceilf((p2d.x + radius) / (float)kTileWidth));
+        int y_min = max(0, (int)floorf((p2d.y - radius) / (float)kTileHeight));
+        int y_max = min((int)grid.y, (int)ceilf((p2d.y + radius) / (float)kTileHeight));
 
         uint32_t d_bit = __float_as_uint(depths[idx]);
 
@@ -163,11 +185,90 @@ __global__ void identifyTileRanges(int L, const uint64_t* keys, uint2* ranges) {
     if (idx == L - 1) ranges[cur_tile].y = L;
 }
 
+__global__ void render_kernel(
+    int W, int H,
+    const uint2* ranges,
+    const uint32_t* point_list,
+    const float2* means2D,
+    const float4* conic_opacity,
+    const float3* colors,
+    float* out_color,
+    float* out_final_T,
+    int* out_n_contrib
+) {
+    auto block = cg::this_thread_block();
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t horizontal_blocks = (W + kTileWidth - 1) / kTileWidth;
+    uint2 tile_id = { blockIdx.x, blockIdx.y };
+    uint2 pix = { tile_id.x * kTileWidth + threadIdx.x, tile_id.y * kTileHeight + threadIdx.y };
+    uint32_t pix_id = W * pix.y + pix.x;
+
+    if (pix.x >= W || pix.y >= H) return;
+
+    uint2 range = ranges[tile_id.y * horizontal_blocks + tile_id.x];
+    int toDo = range.y - range.x;
+
+    __shared__ int collected_id[kThreadsPerBlock];
+    __shared__ float2 collected_xy[kThreadsPerBlock];
+    __shared__ float4 collected_conic_opacity[kThreadsPerBlock];
+
+    float T = 1.0f;
+    float C[3] = {0,0,0};
+    int contrib_count = 0;
+
+    for (int i = 0; i < toDo; i += kThreadsPerBlock) {
+        int fetch_idx = range.x + i + tid;
+        if (fetch_idx < range.y) {
+            int g_id = point_list[fetch_idx];
+            collected_id[tid] = g_id;
+            collected_xy[tid] = means2D[g_id];
+            collected_conic_opacity[tid] = conic_opacity[g_id];
+        }
+        block.sync();
+
+        int batch_size = min(kThreadsPerBlock, toDo - i);
+        for (int j = 0; j < batch_size; j++) {
+            float2 g_xy = collected_xy[j];
+            float4 con_o = collected_conic_opacity[j];
+
+            float2 d = {g_xy.x - (float)pix.x, g_xy.y - (float)pix.y};
+            float power = -0.5f * (d.x * d.x * con_o.x + d.y * d.y * con_o.z) - d.x * d.y * con_o.y;
+
+            if (power > 0.0f) continue;
+
+            float alpha = min(0.99f, con_o.w * expf(power));
+            if (alpha < kAlphaThreshold) continue;
+
+            float weight = alpha * T;
+            int g_id = collected_id[j];
+            C[0] += colors[g_id].x * weight;
+            C[1] += colors[g_id].y * weight;
+            C[2] += colors[g_id].z * weight;
+            contrib_count++;
+
+            T *= (1.0f - alpha);
+
+            if (T < kTransmittanceEpsilon) {
+                i = toDo;
+                break;
+            }
+        }
+        block.sync();
+    }
+
+    out_color[0 * H * W + pix_id] = C[0];
+    out_color[1 * H * W + pix_id] = C[1];
+    out_color[2 * H * W + pix_id] = C[2];
+    out_final_T[pix_id] = T;
+    out_n_contrib[pix_id] = contrib_count;
+}
+
 __global__ void preprocess_points_kernel(
     int P,
     const float3* points3D,
     const float* viewmatrix,
     const float* projmatrix,
+    const float* opacities,
     const float focal_x,
     const float focal_y,
     int W, int H,
@@ -181,7 +282,7 @@ __global__ void preprocess_points_kernel(
     s.point_offsets[idx] = 0;
     float3 p_origin = points3D[idx];
     float3 p_view = transformPoint4x3(p_origin, viewmatrix);
-    if (p_view.z < 0.2f) return;
+    if (p_view.z < kNearPlane) return;
     float4 p_hom = transformPoint4x4(p_origin, projmatrix);
 
     float p_w = 1.0f / (p_hom.w + 1e-7f);
@@ -190,10 +291,10 @@ __global__ void preprocess_points_kernel(
     float2 p2d = s.points2D[idx];
     s.depths[idx] = p_view.z;
 
-    int x_min = max(0, (int)floorf((p2d.x - radius) / 16.0f));
-    int x_max = min((W + 15) / 16, (int)ceilf((p2d.x + radius) / 16.0f));
-    int y_min = max(0, (int)floorf((p2d.y - radius) / 16.0f));
-    int y_max = min((H + 15) / 16, (int)ceilf((p2d.y + radius) / 16.0f));
+    int x_min = max(0, (int)floorf((p2d.x - radius) / (float)kTileWidth));
+    int x_max = min((W + kTileWidth - 1) / kTileWidth, (int)ceilf((p2d.x + radius) / (float)kTileWidth));
+    int y_min = max(0, (int)floorf((p2d.y - radius) / (float)kTileHeight));
+    int y_max = min((H + kTileHeight - 1) / kTileHeight, (int)ceilf((p2d.y + radius) / (float)kTileHeight));
     s.tile_counts[idx] = max(0, x_max - x_min) * max(0, y_max - y_min);
 
     computeCov3D(s.scales[idx], s.quat[idx], s.cov3D + (idx * 6));
@@ -201,21 +302,36 @@ __global__ void preprocess_points_kernel(
     float det = cov2D.x * cov2D.z - cov2D.y * cov2D.y;
     if (det <= 0.0f) return;
     float det_inv = 1.f / det;
-    s.conic[idx] = { cov2D.z * det_inv, -cov2D.y * det_inv, cov2D.x * det_inv };
+    s.conic_opacity[idx] = { cov2D.z * det_inv, -cov2D.y * det_inv, cov2D.x * det_inv, opacities[idx] };
 }
 
-void preprocess_points(int P, const float3* points3D, const float* viewmatrix, const float* projmatrix,
-const float focal_x, const float focal_y, int W, int H, float r, PointState s) {
-    preprocess_points_kernel<<<(P + 255) / 256, 256>>>(P, points3D, viewmatrix, projmatrix, focal_x, focal_y, W, H, r, s);
+void preprocess_points(
+    int P,
+    const float3* points3D,
+    const float* viewmatrix,
+    const float* projmatrix,
+    const float* opacities,
+    const float focal_x,
+    const float focal_y,
+    int W,
+    int H,
+    float r,
+    PointState s) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    preprocess_points_kernel<<<(P + 255) / 256, 256, 0, stream>>>(
+        P, points3D, viewmatrix, projmatrix, opacities, focal_x, focal_y, W, H, r, s);
 }
 
 void duplicate_points(int P, int L, int W, int H, float radius, int grid_x, int grid_y, PointState s){
     dim3 grid(grid_x, grid_y, 1);
-    duplicateWithKeys<<<(P + 255) / 256, 256>>>(P, s.points2D, s.depths, s.point_offsets, s.sort_keys, s.sort_values, W, H, radius, grid);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    duplicateWithKeys<<<(P + 255) / 256, 256, 0, stream>>>(P, s.points2D, s.depths, s.point_offsets, s.sort_keys, s.sort_values, W, H, radius, grid);
 }
 
 void identify_ranges(int L, const uint64_t* keys, uint2* ranges_ptr){
-    identifyTileRanges<<<(L + 255) / 256, 256>>>(L, keys, ranges_ptr);
+    if (L <= 0) return;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    identifyTileRanges<<<(L + 255) / 256, 256, 0, stream>>>(L, keys, ranges_ptr);
 }
 
 std::tuple<
@@ -225,13 +341,16 @@ std::tuple<
     torch::Tensor,
     torch::Tensor,
     torch::Tensor,
+    torch::Tensor,
     torch::Tensor>
-run_tiler_cuda(
+preprocess_cuda(
     torch::Tensor points3D,
     torch::Tensor viewmatrix,
     torch::Tensor projmatrix,
     torch::Tensor scales,
     torch::Tensor rotations,
+    torch::Tensor colors,
+    torch::Tensor opacities,
     float focal_x,
     float focal_y,
     int W,
@@ -239,8 +358,8 @@ run_tiler_cuda(
     float radius)
 {
     int P = points3D.size(0);
-    const int grid_x = (W + 15) / 16;
-    const int grid_y = (H + 15) / 16;
+    const int grid_x = (W + kTileWidth - 1) / kTileWidth;
+    const int grid_y = (H + kTileHeight - 1) / kTileHeight;
     const int num_tiles = grid_x * grid_y;
 
     auto pts_c = points3D.contiguous();
@@ -248,44 +367,45 @@ run_tiler_cuda(
     auto proj_c = projmatrix.contiguous();
     auto sc_c = scales.contiguous();
     auto rot_c = rotations.contiguous();
+    auto col_c = colors.contiguous();
+    auto opa_c = opacities.contiguous();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     auto make_byte_tensor = [&](size_t bytes) {
         return torch::empty({static_cast<long long>(bytes)}, points3D.options().dtype(torch::kByte));
     };
 
-    size_t geom_bytes = P * 96 + 1024;
+    size_t geom_bytes = PointState::bytesRequired(P, 0, 0) + 1024;
     torch::Tensor geom_buffer = make_byte_tensor(geom_bytes);
     char* geom_chunk = reinterpret_cast<char*>(geom_buffer.contiguous().data_ptr());
     PointState s_geom = PointState::fromChunk(geom_chunk, P, 0, 0);
 
-    cudaMemcpyAsync(s_geom.scales, sc_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice);
-    cudaMemcpyAsync(s_geom.quat, rot_c.data_ptr<float>(), P * sizeof(float4), cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(s_geom.scales, sc_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(s_geom.quat, rot_c.data_ptr<float>(), P * sizeof(float4), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(s_geom.colors, col_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice, stream);
 
     preprocess_points(
         P,
         reinterpret_cast<float3*>(pts_c.data_ptr<float>()),
         view_c.data_ptr<float>(),
         proj_c.data_ptr<float>(),
+        opa_c.data_ptr<float>(),
         focal_x,
         focal_y,
         W,
         H,
         radius,
         s_geom);
+    checkCuda(cudaGetLastError(), "preprocess_points first launch");
+    checkCuda(cudaStreamSynchronize(stream), "preprocess_points first sync");
+    auto geom_counts = torch::from_blob(
+        s_geom.tile_counts,
+        {P},
+        points3D.options().dtype(torch::kInt)).clone();
+    uint32_t L = static_cast<uint32_t>(geom_counts.sum().item<int>());
 
     size_t scan_temp_bytes = 0;
-    cub::DeviceScan::InclusiveSum(nullptr, scan_temp_bytes, s_geom.tile_counts, s_geom.point_offsets, P);
-
-    torch::Tensor scan_temp = make_byte_tensor(scan_temp_bytes);
-    cub::DeviceScan::InclusiveSum(
-        scan_temp.data_ptr(),
-        scan_temp_bytes,
-        s_geom.tile_counts,
-        s_geom.point_offsets,
-        P);
-
-    uint32_t L = 0;
-    cudaMemcpy(&L, s_geom.point_offsets + P - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cub::DeviceScan::InclusiveSum(nullptr, scan_temp_bytes, s_geom.tile_counts, s_geom.point_offsets, P, stream);
 
     size_t sort_temp_bytes = 0;
     cub::DeviceRadixSort::SortPairs(
@@ -295,20 +415,23 @@ run_tiler_cuda(
         static_cast<uint64_t*>(nullptr),
         static_cast<uint32_t*>(nullptr),
         static_cast<uint32_t*>(nullptr),
-        L);
+        L,
+        0,
+        sizeof(uint64_t) * 8,
+        stream);
 
     size_t cub_temp_bytes = scan_temp_bytes > sort_temp_bytes ? scan_temp_bytes : sort_temp_bytes;
     size_t final_bytes =
-        geom_bytes +
+        PointState::bytesRequired(P, L, num_tiles) +
         (2 * L * sizeof(uint64_t)) +
         (2 * L * sizeof(uint32_t)) +
-        (num_tiles * sizeof(uint2)) +
         cub_temp_bytes +
         2048;
 
     torch::Tensor final_buffer = make_byte_tensor(final_bytes);
     char* chunk = reinterpret_cast<char*>(final_buffer.contiguous().data_ptr());
     PointState s = PointState::fromChunk(chunk, P, L, num_tiles);
+    cudaMemsetAsync(s.tile_ranges, 0, num_tiles * sizeof(uint2), stream);
 
     uint64_t* sort_keys_out = nullptr;
     uint32_t* sort_values_out = nullptr;
@@ -317,55 +440,164 @@ run_tiler_cuda(
 
     char* cub_temp_ptr = chunk;
 
-    cudaMemcpyAsync(s.scales, sc_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice);
-    cudaMemcpyAsync(s.quat, rot_c.data_ptr<float>(), P * sizeof(float4), cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(s.scales, sc_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(s.quat, rot_c.data_ptr<float>(), P * sizeof(float4), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(s.colors, col_c.data_ptr<float>(), P * sizeof(float3), cudaMemcpyDeviceToDevice, stream);
 
     preprocess_points(
         P,
         reinterpret_cast<float3*>(pts_c.data_ptr<float>()),
         view_c.data_ptr<float>(),
         proj_c.data_ptr<float>(),
+        opa_c.data_ptr<float>(),
         focal_x,
         focal_y,
         W,
         H,
         radius,
         s);
+    checkCuda(cudaGetLastError(), "preprocess_points second launch");
+    checkCuda(cudaStreamSynchronize(stream), "preprocess_points second sync");
 
     cub::DeviceScan::InclusiveSum(
         cub_temp_ptr,
         scan_temp_bytes,
         s.tile_counts,
         s.point_offsets,
-        P);
+        P,
+        stream);
+    checkCuda(cudaGetLastError(), "scan second launch");
+    checkCuda(cudaStreamSynchronize(stream), "scan second sync");
 
-    duplicate_points(P, L, W, H, radius, grid_x, grid_y, s);
+    if (L > 0) {
+        duplicate_points(P, L, W, H, radius, grid_x, grid_y, s);
+        checkCuda(cudaGetLastError(), "duplicate_points launch");
+        checkCuda(cudaStreamSynchronize(stream), "duplicate_points sync");
 
-    cub::DeviceRadixSort::SortPairs(
-        cub_temp_ptr,
-        sort_temp_bytes,
-        s.sort_keys,
-        sort_keys_out,
-        s.sort_values,
-        sort_values_out,
-        L);
+        cub::DeviceRadixSort::SortPairs(
+            cub_temp_ptr,
+            sort_temp_bytes,
+            s.sort_keys,
+            sort_keys_out,
+            s.sort_values,
+            sort_values_out,
+            L,
+            0,
+            sizeof(uint64_t) * 8,
+            stream);
+        checkCuda(cudaGetLastError(), "sort_pairs launch");
+        checkCuda(cudaStreamSynchronize(stream), "sort_pairs sync");
 
-    identify_ranges(L, sort_keys_out, s.tile_ranges);
+        identify_ranges(L, sort_keys_out, s.tile_ranges);
+        checkCuda(cudaGetLastError(), "identify_ranges launch");
+        checkCuda(cudaStreamSynchronize(stream), "identify_ranges sync");
+    }
 
     auto res_2d = torch::from_blob(s.points2D, {P, 2}, points3D.options()).clone();
+    auto res_depths = torch::from_blob(s.depths, {P}, points3D.options()).clone();
     auto res_counts = torch::from_blob(s.tile_counts, {P}, points3D.options().dtype(torch::kInt)).clone();
     auto res_cov3d = torch::from_blob(s.cov3D, {P, 6}, points3D.options()).clone();
-    auto res_conic = torch::from_blob(s.conic, {P, 3}, points3D.options()).clone();
+    auto res_conic_opacity = torch::from_blob(s.conic_opacity, {P, 4}, points3D.options()).clone();
+    auto res_colors = torch::from_blob(s.colors, {P, 3}, points3D.options()).clone();
     auto res_ranges = torch::from_blob(s.tile_ranges, {num_tiles, 2}, points3D.options().dtype(torch::kInt)).clone();
-    auto res_keys = torch::from_blob(sort_keys_out, {L}, points3D.options().dtype(torch::kInt64)).clone();
-    auto res_values = torch::from_blob(sort_values_out, {L}, points3D.options().dtype(torch::kInt)).clone();
+    auto res_point_list = torch::from_blob(sort_values_out, {L}, points3D.options().dtype(torch::kInt)).clone();
 
     return std::make_tuple(
         res_2d,
+        res_depths,
         res_counts,
         res_cov3d,
-        res_conic,
+        res_conic_opacity,
+        res_colors,
         res_ranges,
-        res_keys,
-        res_values);
+        res_point_list);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+render_forward_cuda(
+    torch::Tensor points2D,
+    torch::Tensor conic_opacity,
+    torch::Tensor colors,
+    torch::Tensor tile_ranges,
+    torch::Tensor point_list,
+    int W,
+    int H)
+{
+    auto means2D_c = points2D.contiguous();
+    auto conic_c = conic_opacity.contiguous();
+    auto colors_c = colors.contiguous();
+    auto ranges_c = tile_ranges.contiguous();
+    auto point_list_c = point_list.contiguous();
+
+    auto out_color = torch::zeros({3, H, W}, points2D.options().dtype(torch::kFloat));
+    auto out_final_T = torch::ones({H, W}, points2D.options().dtype(torch::kFloat));
+    auto out_n_contrib = torch::zeros({H, W}, points2D.options().dtype(torch::kInt));
+
+    if (point_list_c.numel() == 0) {
+        return std::make_tuple(out_color, out_final_T, out_n_contrib);
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid((W + kTileWidth - 1) / kTileWidth, (H + kTileHeight - 1) / kTileHeight, 1);
+    dim3 block(kTileWidth, kTileHeight, 1);
+    render_kernel<<<grid, block, 0, stream>>>(
+        W,
+        H,
+        reinterpret_cast<uint2*>(ranges_c.data_ptr<int>()),
+        reinterpret_cast<uint32_t*>(point_list_c.data_ptr<int>()),
+        reinterpret_cast<float2*>(means2D_c.data_ptr<float>()),
+        reinterpret_cast<float4*>(conic_c.data_ptr<float>()),
+        reinterpret_cast<float3*>(colors_c.data_ptr<float>()),
+        out_color.data_ptr<float>(),
+        out_final_T.data_ptr<float>(),
+        out_n_contrib.data_ptr<int>());
+    checkCuda(cudaGetLastError(), "render_kernel launch");
+    checkCuda(cudaStreamSynchronize(stream), "render_kernel sync");
+
+    return std::make_tuple(out_color, out_final_T, out_n_contrib);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+render_scene_cuda(
+    torch::Tensor points3D,
+    torch::Tensor viewmatrix,
+    torch::Tensor projmatrix,
+    torch::Tensor scales,
+    torch::Tensor rotations,
+    torch::Tensor colors,
+    torch::Tensor opacities,
+    float focal_x,
+    float focal_y,
+    int W,
+    int H,
+    float radius)
+{
+    auto outputs = preprocess_cuda(
+        points3D,
+        viewmatrix,
+        projmatrix,
+        scales,
+        rotations,
+        colors,
+        opacities,
+        focal_x,
+        focal_y,
+        W,
+        H,
+        radius);
+
+    auto points2D = std::get<0>(outputs);
+    auto conic_opacity = std::get<4>(outputs);
+    auto colors_out = std::get<5>(outputs);
+    auto tile_ranges = std::get<6>(outputs);
+    auto point_list = std::get<7>(outputs);
+
+    return render_forward_cuda(
+        points2D,
+        conic_opacity,
+        colors_out,
+        tile_ranges,
+        point_list,
+        W,
+        H);
 }

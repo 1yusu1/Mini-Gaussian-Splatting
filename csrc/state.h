@@ -17,7 +17,8 @@ struct PointState {
     float* cov3D;
     float4* quat;
     float3* scales;
-    float3* conic;
+    float4* conic_opacity;
+    float3* colors;
 
     uint32_t* point_offsets;
     uint64_t* sort_keys;
@@ -32,12 +33,36 @@ struct PointState {
         obtain(chunk, s.cov3D, P * 6);
         obtain(chunk, s.quat, P);
         obtain(chunk, s.scales, P);
-        obtain(chunk, s.conic, P);
         obtain(chunk, s.point_offsets, P);
+        obtain(chunk, s.conic_opacity, P);
+        obtain(chunk, s.colors, P);
 
         obtain(chunk, s.sort_keys, L);
         obtain(chunk, s.sort_values, L);
         obtain(chunk, s.tile_ranges, num_tiles);
         return s;
+    }
+
+    static size_t bytesRequired(size_t P, size_t L, size_t num_tiles) {
+        uintptr_t offset = 0;
+        auto bump = [&](size_t elem_size, size_t count, size_t alignment = 128) {
+            offset = (offset + alignment - 1) & ~(alignment - 1);
+            offset += elem_size * count;
+        };
+
+        bump(sizeof(float2), P);
+        bump(sizeof(float), P);
+        bump(sizeof(int), P);
+        bump(sizeof(float), P * 6);
+        bump(sizeof(float4), P);
+        bump(sizeof(float3), P);
+        bump(sizeof(uint32_t), P);
+        bump(sizeof(float4), P);
+        bump(sizeof(float3), P);
+
+        bump(sizeof(uint64_t), L);
+        bump(sizeof(uint32_t), L);
+        bump(sizeof(uint2), num_tiles);
+        return static_cast<size_t>(offset);
     }
 };

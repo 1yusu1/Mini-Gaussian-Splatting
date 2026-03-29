@@ -7,7 +7,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="my_gs_ops",
-            sources=["csrc/binding.cpp", "csrc/kernel.cu"],
+            sources=["csrc/binding.cpp", "csrc/api.cpp", "csrc/kernel.cu", "csrc/backward.cu"],
         )
     ],
     cmdclass={"build_ext": BuildExtension}
