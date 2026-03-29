@@ -1,21 +1,16 @@
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cooperative_groups.h>
 #include <cuda_runtime.h>
-#include <cmath>
 #include <stdexcept>
 
 #include "ops.h"
-
-namespace cg = cooperative_groups;
 
 namespace {
 
 constexpr int kTileWidth = 16;
 constexpr int kTileHeight = 16;
 constexpr int kThreadsPerBlock = kTileWidth * kTileHeight;
-constexpr float kNearPlane = 0.2f;
 constexpr float kAlphaThreshold = 1.0f / 255.0f;
 constexpr float kTransmittanceEpsilon = 0.0001f;
 
@@ -135,15 +130,16 @@ render_backward_cuda(
     auto colors_c = colors.contiguous();
     auto ranges_c = tile_ranges.contiguous();
     auto point_list_c = point_list.contiguous();
-    auto final_T_c = final_T.contiguous();
-    auto n_contrib_c = n_contrib.contiguous();
     auto grad_image_c = grad_image.contiguous();
-    auto grad_final_T_c = grad_final_T.contiguous();
 
     const auto P = points2D.size(0);
     auto grad_points2D = torch::zeros({P, 2}, points2D.options().dtype(torch::kFloat));
     auto grad_conic_opacity = torch::zeros({P, 4}, conic_opacity.options().dtype(torch::kFloat));
     auto grad_colors = torch::zeros({P, 3}, colors.options().dtype(torch::kFloat));
+
+    (void)final_T;
+    (void)n_contrib;
+    (void)grad_final_T;
 
     if (point_list_c.numel() == 0) {
         return std::make_tuple(grad_points2D, grad_conic_opacity, grad_colors);

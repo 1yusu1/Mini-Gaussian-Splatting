@@ -17,3 +17,8 @@ my_gs_ops.cpp
 .vscode/
 .idea/
 .DS_Store
+
+# Local test and visualization helpers
+test_build.py
+visualize_render.py
+debug_outputs/
